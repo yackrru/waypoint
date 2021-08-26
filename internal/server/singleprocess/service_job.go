@@ -193,17 +193,8 @@ func (s *service) queueJobReqToJob(
 	// runners, then we dutifully launch an ondemand runner now. We'll also assign the job to this
 	// new runner now, so that it doesn't get picked up by other runners.
 	if od != nil {
-		runnerId, err := s.launchOnDemandRunner(ctx, job, project, od)
-		if err != nil {
+		if err := s.launchOnDemandRunner(ctx, job, project, od); err != nil {
 			return nil, err
-		}
-
-		job.TargetRunner = &pb.Ref_Runner{
-			Target: &pb.Ref_Runner_Id{
-				Id: &pb.Ref_RunnerId{
-					Id: runnerId,
-				},
-			},
 		}
 	}
 
@@ -227,30 +218,38 @@ func (s *service) QueueJob(
 	return &pb.QueueJobResponse{JobId: job.Id}, nil
 }
 
+// launchOnDemandRunner creates a Task entry and queues a Job to start
+// a task to serve as an on-demand runner. The source job is automatically
+// modified to target the specific on-demand runner instance.
 func (s *service) launchOnDemandRunner(
 	ctx context.Context,
 	source *pb.Job,
 	project *pb.Project,
 	odref *pb.Ref_OnDemandRunnerConfig,
-) (string, error) {
+) error {
 	log := hclog.FromContext(ctx)
 
+	// Get the configuration we should target
 	od, err := s.state.OnDemandRunnerConfigGet(odref)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	runnerId, err := server.Id()
 	if err != nil {
-		return "", err
+		return status.Errorf(codes.Internal, "uuid generation failed: %s", err)
 	}
-
-	log.Info("requesting ondemand runner via task start", "runner-id", runnerId)
+	taskId, err := server.Id()
+	if err != nil {
+		return status.Errorf(codes.Internal, "uuid generation failed: %s", err)
+	}
+	log = log.With("on-demand-runner-id", runnerId, "task-id", taskId)
+	log.Info("requesting ondemand runner via task start")
 
 	// Get our server config
 	cfg, err := s.state.ServerConfigGet()
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	// Follow the same logic as RunnerGetDeploymentConfig, which includes this note:
@@ -258,9 +257,8 @@ func (s *service) launchOnDemandRunner(
 	// multiple addresses yet. In the future we will want to support more
 	// advanced choicing.
 
-	var addr *pb.ServerConfig_AdvertiseAddr
-
 	// This should only happen during tests
+	var addr *pb.ServerConfig_AdvertiseAddr
 	if len(cfg.AdvertiseAddrs) == 0 {
 		log.Info("server has no advertise addrs, using localhost")
 		addr = &pb.ServerConfig_AdvertiseAddr{
@@ -279,7 +277,7 @@ func (s *service) launchOnDemandRunner(
 		}},
 	})
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	scfg := serverconfig.Client{
@@ -292,18 +290,19 @@ func (s *service) launchOnDemandRunner(
 
 	envVars := scfg.EnvMap()
 	envVars["WAYPOINT_RUNNER_ID"] = runnerId
-
 	for k, v := range od.EnvironmentVariables {
 		envVars[k] = v
 	}
 
 	args := []string{"runner", "agent", "-vv", "-id", runnerId, "-odr"}
 
+	// Build up our on-demand runner task launching job.
 	job := &pb.Job{
 		Workspace:   source.Workspace,
 		Application: source.Application,
 		Operation: &pb.Job_StartTask{
 			StartTask: &pb.Job_StartTaskLaunchOp{
+				Task: &pb.Ref_Task{Id: taskId},
 				Params: &pb.Job_TaskPluginParams{
 					PluginType: od.PluginType,
 					HclConfig:  od.PluginConfig,
@@ -316,42 +315,66 @@ func (s *service) launchOnDemandRunner(
 				},
 			},
 		},
+
+		// Our task launching job can run anywhere.
+		TargetRunner: &pb.Ref_Runner{
+			Target: &pb.Ref_Runner_Any{
+				Any: &pb.Ref_RunnerAny{},
+			},
+		},
 	}
 
 	// Get the next id
-	id, err := server.Id()
+	job.Id, err = server.Id()
 	if err != nil {
-		return "", status.Errorf(codes.Internal, "uuid generation failed: %s", err)
+		return status.Errorf(codes.Internal, "uuid generation failed: %s", err)
 	}
-	job.Id = id
 
-	// We're going to wait up to 60s for the job be picked up. No reason it won't be
-	// picked up immediately.
+	// We're going to wait up to 60s for the job be picked up.
 	dur, err := time.ParseDuration("60s")
 	if err != nil {
-		return "", status.Errorf(codes.FailedPrecondition,
+		return status.Errorf(codes.FailedPrecondition,
 			"Invalid expiry duration: %s", err.Error())
 	}
 
 	job.ExpireTime, err = ptypes.TimestampProto(time.Now().Add(dur))
 	if err != nil {
-		return "", status.Errorf(codes.Aborted, "error configuring expiration: %s", err)
+		return status.Errorf(codes.Aborted, "error configuring expiration: %s", err)
 	}
 
-	job.TargetRunner = &pb.Ref_Runner{
-		Target: &pb.Ref_Runner_Any{
-			Any: &pb.Ref_RunnerAny{},
-		},
+	// Create the task to represent our ODR.
+	task := &pb.Task{
+		Id: taskId,
+
+		// Initial state is pending while we wait for our job above
+		// to run and then we'll update this in GetJobStream.
+		PhysicalState: pb.Operation_PENDING,
+	}
+
+	// Create our task. Note that this job is referencing this task ID
+	// in the StartTask params which is how we associate everything.
+	if err := s.state.TaskPut(task); err != nil {
+		return err
 	}
 
 	// Queue the job
 	if err := s.state.JobCreate(job); err != nil {
-		return "", err
+		s.state.TaskDelete(&pb.Ref_Task{Id: taskId})
+		return err
 	}
 
-	log.Debug("queue'd task to start on-demand runner", "job-id", job.Id, "runner-id", runnerId)
+	log.Debug("queued task to start on-demand runner", "job-id", job.Id)
 
-	return runnerId, nil
+	// Modify our source to target this runner
+	source.TargetRunner = &pb.Ref_Runner{
+		Target: &pb.Ref_Runner_Id{
+			Id: &pb.Ref_RunnerId{
+				Id: runnerId,
+			},
+		},
+	}
+
+	return nil
 }
 
 func (s *service) ValidateJob(
