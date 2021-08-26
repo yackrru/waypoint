@@ -1010,6 +1010,21 @@ message TaskLaunchInfo {
   repeated string arguments = 3;
 }
 
+// Task is the internal representation of a task.
+message Task {
+  string id = 1;
+
+  // The physical state of this task. If this is created then it means
+  // that StartTask was called in the plugin and a non-nil response was
+  // received.
+  Operation.PhysicalState physical_state = 2;
+
+  // State is the state returned by the start task operation. This is
+  // internal plugin state used to call future lifecycle functions and
+  // isn't inspected by Waypoint at all.
+  google.protobuf.Any state = 3;
+}
+
 /********************************************************************
 * User
 ********************************************************************/
@@ -1709,6 +1724,10 @@ message Job {
   }
 
   message StartTaskLaunchOp {
+    // ID of the internal task representation in the Waypoint server.
+    // This should not be sent to plugins.
+    string task_id = 3;
+
     // The info to use to create the task
     TaskLaunchInfo info = 1;
 
