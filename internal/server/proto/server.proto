@@ -825,6 +825,11 @@ message Ref {
   message OnDemandRunnerConfig {
     string id = 1;
   }
+
+  // References a task.
+  message Task {
+    string id = 1;
+  }
 }
 
 // Component represents metadata about a component. A component is the
@@ -1022,7 +1027,7 @@ message Task {
   // State is the state returned by the start task operation. This is
   // internal plugin state used to call future lifecycle functions and
   // isn't inspected by Waypoint at all.
-  google.protobuf.Any state = 3;
+  google.protobuf.Any plugin_state = 3;
 }
 
 /********************************************************************
@@ -1726,7 +1731,7 @@ message Job {
   message StartTaskLaunchOp {
     // ID of the internal task representation in the Waypoint server.
     // This should not be sent to plugins.
-    string task_id = 3;
+    Ref.Task task_id = 3;
 
     // The info to use to create the task
     TaskLaunchInfo info = 1;
