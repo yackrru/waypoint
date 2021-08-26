@@ -1731,7 +1731,7 @@ message Job {
   message StartTaskLaunchOp {
     // ID of the internal task representation in the Waypoint server.
     // This should not be sent to plugins.
-    Ref.Task task_id = 3;
+    Ref.Task task = 3;
 
     // The info to use to create the task
     TaskLaunchInfo info = 1;
